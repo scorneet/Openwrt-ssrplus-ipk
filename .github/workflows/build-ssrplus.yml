@@ -1,8 +1,4 @@
 name: Build SSR Plus ipk
-# Extended Description:
-# This workflow builds the latest luci-app-ssr-plus as OpenWrt .ipk using the official SDK
-# without compiling any firmware image. It fetches only minimal feeds (sbwml/openwrt_pkgs),
-# caches the dl directory, uploads artifacts, and publishes a GitHub Release for online upgrade.
 
 on:
   workflow_dispatch:
@@ -11,7 +7,7 @@ on:
       - ".github/workflows/build-ssrplus.yml"
 
 env:
-  # Set to "" to force snapshots. Default tries releases/24.10.2 then fallbacks to snapshots.
+  # 设为 "" 可强制使用 snapshots
   OWRT_VER: "24.10.2"
   TARGET: "x86"
   SUBTARGET: "64"
@@ -31,31 +27,67 @@ jobs:
             libncurses5-dev gawk gettext libssl-dev xsltproc \
             libxml-parser-perl zlib1g-dev file ca-certificates
 
-      - name: Download OpenWrt SDK (auto-detect; fallback to snapshots)
-        id: sdk
+      # ====== 关键修复：稳健探测 SDK 并回退 ======
+      - name: Resolve SDK URL (release → snapshots)
+        id: sdkurl
         shell: bash
         run: |
           set -e
-          if [[ -n "${OWRT_VER}" ]]; then
-            BASE_URL="https://downloads.openwrt.org/releases/${OWRT_VER}/targets/${TARGET}/${SUBTARGET}/"
-            SDK_FILE=$(wget -qO- "${BASE_URL}" | grep -oE 'openwrt-sdk-[^"]+\.tar\.xz' | head -n1 || true)
+          TUPLE="${TARGET}/${SUBTARGET}"
+
+          find_sdk () {
+            local base="$1"
+            local url=""
+            # 先尝试 sha256sums（更稳定）
+            if curl -fsSL "${base}sha256sums" >/tmp/sha 2>/dev/null; then
+              url=$(awk '{print $2}' /tmp/sha | sed 's/^\*//' | grep -m1 '^openwrt-sdk-.*\.tar\.xz$' || true)
+              if [ -n "$url" ]; then echo "${base}${url}"; return 0; fi
+            fi
+            # 再尝试目录索引页面
+            url=$(curl -fsSL "${base}" | grep -Eo 'openwrt-sdk-[^" ]+\.tar\.xz' | head -n1 || true)
+            if [ -n "$url" ]; then echo "${base}${url}"; return 0; fi
+            return 1
+          }
+
+          CANDIDATE=""
+          if [ -n "${OWRT_VER}" ]; then
+            REL_BASE="https://downloads.openwrt.org/releases/${OWRT_VER}/targets/${TUPLE}/"
+            CANDIDATE=$(find_sdk "${REL_BASE}" || true)
+            if [ -n "$CANDIDATE" ]; then
+              echo "Found release SDK: $CANDIDATE"
+            else
+              echo "Release SDK not found, falling back to snapshots..."
+            fi
           fi
-          if [[ -z "${SDK_FILE}" ]]; then
-            echo "Release SDK not found, falling back to snapshots..."
-            BASE_URL="https://downloads.openwrt.org/snapshots/targets/${TARGET}/${SUBTARGET}/"
-            SDK_FILE=$(wget -qO- "${BASE_URL}" | grep -oE 'openwrt-sdk-[^"]+\.tar\.xz' | head -n1)
+
+          if [ -z "$CANDIDATE" ]; then
+            SNAP_BASE="https://downloads.openwrt.org/snapshots/targets/${TUPLE}/"
+            CANDIDATE=$(find_sdk "${SNAP_BASE}" || true)
           fi
-          echo "SDK_URL=${BASE_URL}${SDK_FILE}"
-          wget -q "${BASE_URL}${SDK_FILE}"
-          tar -xJf "${SDK_FILE}"
-          SDK_DIR=$(echo openwrt-sdk-*)
-          mv "${SDK_DIR}" openwrt-sdk
+
+          if [ -z "$CANDIDATE" ]; then
+            echo "ERROR: No SDK tarball found for ${TUPLE}."
+            echo "---- RELEASE LISTING (${REL_BASE:-N/A}) ----"
+            curl -fsSL "${REL_BASE}" 2>/dev/null || true
+            echo "---- SNAPSHOTS LISTING (${SNAP_BASE}) ----"
+            curl -fsSL "${SNAP_BASE}" 2>/dev/null || true
+            exit 2
+          fi
+
+          echo "SDK_URL=$CANDIDATE" | tee -a $GITHUB_ENV
+          echo "url=$CANDIDATE" >> $GITHUB_OUTPUT
+
+      - name: Download & extract SDK
+        run: |
+          curl -fLo sdk.tar.xz "$SDK_URL"
+          tar -xJf sdk.tar.xz
+          mv openwrt-sdk-* openwrt-sdk
           echo "SDK_DIR=openwrt-sdk" >> $GITHUB_ENV
+      # ====== 关键修复到此 ======
 
       - name: Minimal feeds (only what we need)
         run: |
           cd "${SDK_DIR}"
-          # sbwml feed 提供 ssr-plus 与主要依赖
           echo 'src-git sbwml https://github.com/sbwml/openwrt_pkgs.git;master' >> feeds.conf.default
           ./scripts/feeds update sbwml
           ./scripts/feeds install -p sbwml luci-app-ssr-plus
@@ -81,7 +113,7 @@ jobs:
           CONFIG_PACKAGE_v2ray-geosite=y
           CONFIG_PACKAGE_shadowsocks-libev-ss-local=y
           CONFIG_PACKAGE_shadowsocks-libev-ss-redir=y
-          # Optional extra backends:
+          # Optional:
           # CONFIG_PACKAGE_naiveproxy=y
           # CONFIG_PACKAGE_kcptun-client=y
           CFG
@@ -91,7 +123,6 @@ jobs:
         run: |
           cd "${SDK_DIR}"
           make package/luci-app-ssr-plus/compile -j"$(nproc)" V=s
-          # 依赖包（尽量一起产出，失败不致停）
           make package/xray-core/compile -j"$(nproc)" V=s || true
           make package/v2ray-geoip/compile -j"$(nproc)" V=s || true
           make package/v2ray-geosite/compile -j"$(nproc)" V=s || true
